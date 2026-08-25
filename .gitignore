@@ -6,3 +6,6 @@ __pycache__/
 .DS_Store
 .streamlit/secrets.toml
 .local/
+build/
+dist/
+*.spec
