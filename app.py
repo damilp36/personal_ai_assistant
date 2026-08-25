@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import base64
 import binascii
-import os
+import hmac
+import math
 from datetime import datetime
+from time import monotonic
 from typing import Any
 
 import streamlit as st
 
+from assistant.config import AppConfig, load_app_config
 from assistant.files import (
     STREAMLIT_FILE_TYPES,
     FilePreparationError,
@@ -20,7 +23,6 @@ from assistant.ollama_client import OllamaClient, OllamaError
 from assistant.prompts import PROFILE_PROMPTS, build_system_prompt
 from assistant.settings import SettingsError, load_extra_rules, save_extra_rules
 
-DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 ANSWER_LENGTHS = {
     "Short": 256,
     "Medium": 512,
@@ -47,22 +49,37 @@ st.markdown(
 )
 
 
-def init_state() -> None:
+def read_streamlit_secrets() -> dict[str, Any]:
+    """Read hosted secrets without requiring a local secrets file."""
+
     try:
-        saved_rules = load_extra_rules()
-        settings_error = None
-    except SettingsError as error:
-        saved_rules = ""
-        settings_error = str(error)
+        return dict(st.secrets)
+    except FileNotFoundError:
+        return {}
+
+
+APP_CONFIG = load_app_config(read_streamlit_secrets())
+
+
+def init_state(config: AppConfig) -> None:
+    saved_rules = ""
+    settings_error = None
+    if "extra_rules" not in st.session_state and not config.cloud_mode:
+        try:
+            saved_rules = load_extra_rules()
+        except SettingsError as error:
+            settings_error = str(error)
     defaults = {
         "messages": [],
         "selected_model": None,
         "pending_model": None,
-        "ollama_url": DEFAULT_OLLAMA_URL,
+        "ollama_url": config.ollama_base_url,
         "pull_notice": None,
         "extra_rules": saved_rules,
         "rules_notice": None,
         "settings_error": settings_error,
+        "authenticated": not config.cloud_mode,
+        "request_times": [],
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -72,6 +89,9 @@ def init_state() -> None:
 def save_rules() -> None:
     """Save the rules currently held by the text-area widget."""
 
+    if APP_CONFIG.cloud_mode:
+        st.session_state.rules_notice = "Your rules will last for this session."
+        return
     try:
         save_extra_rules(st.session_state.extra_rules)
         st.session_state.rules_notice = "Your rules were saved."
@@ -83,6 +103,10 @@ def save_rules() -> None:
 def clear_rules() -> None:
     """Clear the widget and its saved local value."""
 
+    if APP_CONFIG.cloud_mode:
+        st.session_state.extra_rules = ""
+        st.session_state.rules_notice = "Your session rules were cleared."
+        return
     try:
         save_extra_rules("")
         st.session_state.extra_rules = ""
@@ -92,14 +116,54 @@ def clear_rules() -> None:
         st.session_state.settings_error = str(error)
 
 
+def logout() -> None:
+    """End access and clear private session content."""
+
+    st.session_state.authenticated = False
+    st.session_state.messages = []
+    st.session_state.extra_rules = ""
+    st.session_state.request_times = []
+
+
+def take_request_slot(limit: int) -> int | None:
+    """Reserve a per-session request slot or return seconds until retry."""
+
+    now = monotonic()
+    recent = [stamp for stamp in st.session_state.request_times if now - stamp < 60]
+    st.session_state.request_times = recent
+    if len(recent) >= limit:
+        return max(1, math.ceil(60 - (now - recent[0])))
+    st.session_state.request_times.append(now)
+    return None
+
+
+def make_ollama_client(base_url: str) -> OllamaClient:
+    """Create a client with server-only authentication when configured."""
+
+    return OllamaClient(
+        base_url,
+        api_key=APP_CONFIG.ollama_api_key,
+        show_url_in_errors=not APP_CONFIG.cloud_mode,
+    )
+
+
 @st.cache_data(ttl=4, show_spinner=False)
-def get_server_info(base_url: str) -> dict[str, Any]:
-    client = OllamaClient(base_url)
+def get_server_info(base_url: str, _api_key: str, cloud_mode: bool) -> dict[str, Any]:
+    client = OllamaClient(
+        base_url,
+        api_key=_api_key,
+        show_url_in_errors=not cloud_mode,
+    )
     try:
+        models = client.list_models()
+        try:
+            version = client.version()
+        except OllamaError:
+            version = "unknown"
         return {
             "connected": True,
-            "version": client.version(),
-            "models": client.list_models(),
+            "version": version,
+            "models": models,
             "error": "",
         }
     except OllamaError as error:
@@ -165,27 +229,69 @@ def export_chat(messages: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-init_state()
+init_state(APP_CONFIG)
+
+if APP_CONFIG.errors:
+    st.title("Setup needed")
+    st.error("The hosted app settings are not complete.")
+    for config_error in APP_CONFIG.errors:
+        st.code(config_error)
+    st.caption("The app owner must update the Streamlit secrets, then restart the app.")
+    st.stop()
+
+if APP_CONFIG.cloud_mode and not st.session_state.authenticated:
+    st.title("🧸 My Local Note Taker")
+    st.caption("Enter the access password to continue.")
+    with st.form("access_form", clear_on_submit=True):
+        password_attempt = st.text_input("Password", type="password")
+        sign_in = st.form_submit_button("Open note taker", use_container_width=True)
+    if sign_in:
+        if hmac.compare_digest(password_attempt, APP_CONFIG.access_password):
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error("That password is not right.")
+    st.stop()
 
 with st.sidebar:
     st.title("Settings")
-    base_url = st.text_input(
-        "Ollama address",
-        key="ollama_url",
-        help="The normal local address is http://localhost:11434.",
-    )
+    if APP_CONFIG.cloud_mode:
+        base_url = APP_CONFIG.ollama_base_url
+        st.caption("🔒 Secure cloud mode")
+    else:
+        base_url = st.text_input(
+            "Ollama address",
+            key="ollama_url",
+            help="The normal local address is http://localhost:11434.",
+        )
     refresh = st.button("↻ Check Ollama", use_container_width=True)
     if refresh:
         get_server_info.clear()
 
-    server = get_server_info(base_url)
+    server = get_server_info(
+        base_url,
+        APP_CONFIG.ollama_api_key,
+        APP_CONFIG.cloud_mode,
+    )
     if server["connected"]:
-        st.success(f"Ollama is ready · v{server['version']}")
+        if APP_CONFIG.cloud_mode:
+            st.success("Model service is ready")
+        else:
+            st.success(f"Ollama is ready · v{server['version']}")
     else:
         st.error("Ollama is not ready")
         st.caption(server["error"])
 
     models = server["models"]
+    if APP_CONFIG.cloud_mode:
+        models_by_name = {
+            str(model.get("name") or model.get("model")): model for model in models
+        }
+        models = [
+            models_by_name[name]
+            for name in APP_CONFIG.allowed_models
+            if name in models_by_name
+        ]
     model_names = [str(model.get("name") or model.get("model")) for model in models]
     if model_names:
         pending_model = st.session_state.pop("pending_model", None)
@@ -214,41 +320,49 @@ with st.sidebar:
         st.caption(f"Stored size: {human_size(int(chosen.get('size', 0) or 0))}")
     else:
         selected_model = None
-        st.info("No model is installed yet.")
+        if APP_CONFIG.cloud_mode and server["connected"]:
+            st.error(
+                "No allowed model is available. The app owner must check the secrets."
+            )
+        else:
+            st.info("No model is installed yet.")
 
-    with st.expander("Install an Ollama model", expanded=not bool(model_names)):
-        st.caption("Type any model name from the Ollama model library.")
-        new_model = st.text_input(
-            "Model name",
-            placeholder="gemma3:4b",
-            help="The tag after : can select a model size.",
-        )
-        if st.button(
-            "Download model",
-            disabled=not server["connected"] or not new_model.strip(),
-            use_container_width=True,
-        ):
-            client = OllamaClient(base_url)
-            try:
-                with st.status("Starting download…", expanded=True) as download_status:
-                    progress_bar = st.progress(0.0)
-                    progress_text = st.empty()
-                    for update in client.pull_model(new_model):
-                        progress_text.write(update.status)
-                        if update.progress is not None:
-                            progress_bar.progress(update.progress)
-                    progress_bar.progress(1.0)
-                    download_status.update(
-                        label=f"{new_model.strip()} is ready.",
-                        state="complete",
-                        expanded=False,
-                    )
-                st.session_state.pull_notice = f"{new_model.strip()} is ready."
-                st.session_state.pending_model = new_model.strip()
-                get_server_info.clear()
-                st.rerun()
-            except OllamaError as error:
-                st.error(str(error))
+    if not APP_CONFIG.cloud_mode:
+        with st.expander("Install an Ollama model", expanded=not bool(model_names)):
+            st.caption("Type any model name from the Ollama model library.")
+            new_model = st.text_input(
+                "Model name",
+                placeholder="gemma3:4b",
+                help="The tag after : can select a model size.",
+            )
+            if st.button(
+                "Download model",
+                disabled=not server["connected"] or not new_model.strip(),
+                use_container_width=True,
+            ):
+                client = make_ollama_client(base_url)
+                try:
+                    with st.status(
+                        "Starting download…", expanded=True
+                    ) as download_status:
+                        progress_bar = st.progress(0.0)
+                        progress_text = st.empty()
+                        for update in client.pull_model(new_model):
+                            progress_text.write(update.status)
+                            if update.progress is not None:
+                                progress_bar.progress(update.progress)
+                        progress_bar.progress(1.0)
+                        download_status.update(
+                            label=f"{new_model.strip()} is ready.",
+                            state="complete",
+                            expanded=False,
+                        )
+                    st.session_state.pull_notice = f"{new_model.strip()} is ready."
+                    st.session_state.pending_model = new_model.strip()
+                    get_server_info.clear()
+                    st.rerun()
+                except OllamaError as error:
+                    st.error(str(error))
 
     st.divider()
     st.subheader("Note taker style")
@@ -280,18 +394,26 @@ with st.sidebar:
             placeholder="Example: Always answer in a table.",
             max_chars=2_000,
         )
-        save_column, clear_column = st.columns(2)
-        save_column.button(
-            "Save rules",
-            on_click=save_rules,
-            use_container_width=True,
-        )
-        clear_column.button(
-            "Clear rules",
-            on_click=clear_rules,
-            use_container_width=True,
-        )
-        st.caption("Saved rules stay on this computer.")
+        if APP_CONFIG.cloud_mode:
+            st.button(
+                "Clear session rules",
+                on_click=clear_rules,
+                use_container_width=True,
+            )
+            st.caption("Rules last only for this signed-in session.")
+        else:
+            save_column, clear_column = st.columns(2)
+            save_column.button(
+                "Save rules",
+                on_click=save_rules,
+                use_container_width=True,
+            )
+            clear_column.button(
+                "Clear rules",
+                on_click=clear_rules,
+                use_container_width=True,
+            )
+            st.caption("Saved rules stay on this computer.")
         if st.session_state.rules_notice:
             st.success(st.session_state.rules_notice)
             st.session_state.rules_notice = None
@@ -310,9 +432,19 @@ with st.sidebar:
             mime="text/markdown",
             use_container_width=True,
         )
+    if APP_CONFIG.cloud_mode:
+        st.button("Sign out", on_click=logout, use_container_width=True)
+        privacy_note = (
+            "Chat and uploads stay in this signed-in session. "
+            "Requests go to the private model service set by the app owner."
+        )
+    else:
+        privacy_note = (
+            "Chat stays in this browser session. Ollama runs the model on "
+            "the machine at the address above."
+        )
     st.markdown(
-        '<p class="small-note">Chat stays in this browser session. '
-        "Ollama runs the model on the machine at the address above.</p>",
+        f'<p class="small-note">{privacy_note}</p>',
         unsafe_allow_html=True,
     )
 
@@ -328,7 +460,12 @@ if not server["connected"]:
         "Start Ollama, then press **Check Ollama**. The normal command is `ollama serve`."
     )
 elif not selected_model:
-    st.info("Install a model in the left panel. A small model is a good first test.")
+    if APP_CONFIG.cloud_mode:
+        st.info("No model is ready. Please tell the app owner.")
+    else:
+        st.info(
+            "Install a model in the left panel. A small model is a good first test."
+        )
 
 if not st.session_state.messages:
     st.info(
@@ -357,10 +494,18 @@ if submission:
     if not user_text and not uploaded_files:
         st.stop()
 
+    if APP_CONFIG.cloud_mode:
+        retry_after = take_request_slot(APP_CONFIG.requests_per_minute)
+        if retry_after is not None:
+            st.error(f"Too many requests. Please wait {retry_after} seconds.")
+            st.stop()
+
     try:
         prepared = prepare_uploads(uploaded_files)
         if prepared.images:
-            capabilities = OllamaClient(base_url).model_capabilities(selected_model)
+            capabilities = make_ollama_client(base_url).model_capabilities(
+                selected_model
+            )
             if capabilities and "vision" not in capabilities:
                 raise FilePreparationError(
                     f"{selected_model} cannot read images. Pick a model with vision."
@@ -394,7 +539,7 @@ if submission:
         response_box = st.empty()
         full_response = ""
         try:
-            client = OllamaClient(base_url)
+            client = make_ollama_client(base_url)
             for piece in client.stream_chat(
                 model=selected_model,
                 messages=ollama_messages,

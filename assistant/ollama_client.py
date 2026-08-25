@@ -44,13 +44,25 @@ class OllamaClient:
     def __init__(
         self,
         base_url: str = "http://localhost:11434",
+        api_key: str = "",
+        show_url_in_errors: bool = True,
         session: requests.Session | None = None,
     ) -> None:
         self.base_url = normalize_base_url(base_url)
+        self.headers = {"Authorization": f"Bearer {api_key}"} if api_key.strip() else {}
+        self.show_url_in_errors = show_url_in_errors
         self.session = session or requests.Session()
 
     def _url(self, path: str) -> str:
         return f"{self.base_url}/api/{path.lstrip('/')}"
+
+    def _connection_error(self) -> str:
+        if self.show_url_in_errors:
+            return (
+                f"I cannot reach Ollama at {self.base_url}. "
+                "Make sure Ollama is running."
+            )
+        return "I cannot reach the model service. Please try again later."
 
     @staticmethod
     def _error_message(response: requests.Response) -> str:
@@ -72,12 +84,14 @@ class OllamaClient:
     ) -> dict[str, Any]:
         try:
             response = self.session.request(
-                method, self._url(path), timeout=timeout, **kwargs
+                method,
+                self._url(path),
+                headers=self.headers,
+                timeout=timeout,
+                **kwargs,
             )
         except requests.RequestException as error:
-            raise OllamaError(
-                f"I cannot reach Ollama at {self.base_url}. Make sure Ollama is running."
-            ) from error
+            raise OllamaError(self._connection_error()) from error
         if not response.ok:
             raise OllamaError(self._error_message(response))
         try:
@@ -108,13 +122,12 @@ class OllamaClient:
             response = self.session.post(
                 self._url("pull"),
                 json={"model": model, "stream": True},
+                headers=self.headers,
                 stream=True,
                 timeout=(5, 3600),
             )
         except requests.RequestException as error:
-            raise OllamaError(
-                f"I cannot reach Ollama at {self.base_url}. Make sure Ollama is running."
-            ) from error
+            raise OllamaError(self._connection_error()) from error
         if not response.ok:
             raise OllamaError(self._error_message(response))
 
@@ -165,13 +178,12 @@ class OllamaClient:
             response = self.session.post(
                 self._url("chat"),
                 json=payload,
+                headers=self.headers,
                 stream=True,
                 timeout=(10, 600),
             )
         except requests.RequestException as error:
-            raise OllamaError(
-                f"I cannot reach Ollama at {self.base_url}. Make sure Ollama is running."
-            ) from error
+            raise OllamaError(self._connection_error()) from error
         if not response.ok:
             raise OllamaError(self._error_message(response))
 
